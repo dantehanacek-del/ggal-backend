@@ -1,5 +1,4 @@
-const express      = require('express');
-const yahooFinance = require('yahoo-finance2').default;
+const express = require('express');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -12,8 +11,9 @@ const STOOQ_SYMS = {
   '^DJI':  '^dji',
 };
 
-// ── Yahoo Finance: para mercado argentino (BYMA) ──
-const YF_SYMS = ['GGAL.BA', '^MERV', 'BMA.BA', 'BBAR.BA', 'SUPV.BA'];
+// ── data.json generado por GitHub Actions cada 5 min (Yahoo Finance desde GitHub servers) ──
+const DATA_JSON_URL = 'https://raw.githubusercontent.com/dantehanacek-del/ggal-dashboard/main/data.json';
+const AR_SYMS = new Set(['GGAL.BA', '^MERV', 'BMA.BA', 'BBAR.BA', 'SUPV.BA']);
 
 const STOOQ_URL = s => `https://stooq.com/q/l/?f=sd2t2ohlcvde&h&e=csv&s=${s}`;
 
@@ -63,30 +63,38 @@ async function fetchStooq(ySym, sSym) {
   };
 }
 
-async function fetchYF(sym) {
-  const q = await yahooFinance.quote(sym, {}, { validateResult: false });
-  if (!q?.regularMarketPrice) throw new Error('sin precio');
-  return {
-    symbol:                     q.symbol,
-    regularMarketPrice:         q.regularMarketPrice,
-    regularMarketChange:        q.regularMarketChange        ?? 0,
-    regularMarketChangePercent: q.regularMarketChangePercent ?? 0,
-    regularMarketVolume:        q.regularMarketVolume        ?? 0,
-    regularMarketOpen:          q.regularMarketOpen          ?? q.regularMarketPrice,
-  };
+// Fetch data.json de GitHub Actions (Yahoo Finance, símbolos argentinos)
+async function fetchDataJson() {
+  const r = await fetch(DATA_JSON_URL + '?v=' + Date.now(), {
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  const json = await r.json();
+  const results = json?.quoteResponse?.result ?? [];
+  return results
+    .filter(q => AR_SYMS.has(q.symbol))
+    .map(q => ({
+      symbol:                     q.symbol,
+      regularMarketPrice:         q.regularMarketPrice,
+      regularMarketChange:        q.regularMarketChange        ?? 0,
+      regularMarketChangePercent: q.regularMarketChangePercent ?? 0,
+      regularMarketVolume:        q.regularMarketVolume        ?? 0,
+      regularMarketOpen:          q.regularMarketOpen          ?? q.regularMarketPrice,
+    }));
 }
 
 async function fetchAll() {
-  const [stooqResults, yfResults] = await Promise.all([
+  const [stooqResults, arQuotes] = await Promise.all([
     Promise.allSettled(Object.entries(STOOQ_SYMS).map(([y, s]) => fetchStooq(y, s))),
-    Promise.allSettled(YF_SYMS.map(s => fetchYF(s))),
+    fetchDataJson().catch(e => { console.warn('[data.json]', e.message); return []; }),
   ]);
 
   const quotes = [];
-  for (const r of [...stooqResults, ...yfResults]) {
+  for (const r of stooqResults) {
     if (r.status === 'fulfilled') quotes.push(r.value);
-    else console.warn('[fetch]', r.reason?.message || r.reason);
+    else console.warn('[stooq]', r.reason?.message);
   }
+  quotes.push(...arQuotes);
 
   if (!quotes.length) throw new Error('sin datos');
   return { quoteResponse: { result: quotes, error: null } };
