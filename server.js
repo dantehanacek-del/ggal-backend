@@ -1,10 +1,23 @@
 const express = require('express');
-const yahooFinance = require('yahoo-finance2').default;
-
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-const SYMBOLS = ['GGAL', 'GGAL.BA', '^GSPC', '^IXIC', '^DJI', '^MERV', 'BMA.BA', 'BBAR.BA', 'SUPV.BA'];
+// Mapeo símbolo (formato Yahoo) → símbolo Stooq
+const SYMBOLS = {
+  'GGAL':    'ggal.us',
+  'GGAL.BA': 'ggal.ba',
+  '^GSPC':   '^spx',
+  '^IXIC':   '^ndq',
+  '^DJI':    '^dji',
+  '^MERV':   '^merv',
+  'BMA.BA':  'bma.ba',
+  'BBAR.BA': 'bbar.ba',
+  'SUPV.BA': 'supv.ba',
+};
+
+// Formato sin volumen (v) para evitar comas en números que rompen el CSV
+// f=sd2ohlcde → Symbol, Date, Open, High, Low, Close, Change, Change%
+const STOOQ_URL = s => `https://stooq.com/q/l/?f=sd2ohlcde&h&e=csv&s=${s}`;
 
 let cache = { data: null, ts: 0 };
 
@@ -14,44 +27,64 @@ app.use((req, res, next) => {
   next();
 });
 
-async function fetchAllMarket() {
+async function fetchStooq(ySym, sSym) {
+  const r = await fetch(STOOQ_URL(sSym), {
+    headers: { 'User-Agent': 'Mozilla/5.0' },
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  const text = await r.text();
+
+  const lines = text.trim().replace(/\r/g, '').split('\n');
+  if (lines.length < 2) throw new Error('CSV vacío');
+
+  const headers = lines[0].split(',').map(h => h.trim());
+  const vals    = lines[1].split(',').map(v => v.trim());
+
+  const row = {};
+  headers.forEach((h, i) => row[h] = vals[i]);
+
+  const close = parseFloat(row['Close']);
+  const open  = parseFloat(row['Open']);
+  const chg   = parseFloat(row['Change']);
+  const pct   = parseFloat(row['Change%']);
+
+  if (isNaN(close) || close <= 0) throw new Error('precio inválido: ' + JSON.stringify(row));
+
+  return {
+    symbol:                     ySym,
+    regularMarketPrice:         close,
+    regularMarketChange:        isNaN(chg) ? 0 : chg,
+    regularMarketChangePercent: isNaN(pct) ? 0 : pct,
+    regularMarketVolume:        0,
+    regularMarketOpen:          isNaN(open) ? close : open,
+  };
+}
+
+async function fetchAll() {
   const results = await Promise.allSettled(
-    SYMBOLS.map(s => yahooFinance.quote(s, {}, { validateResult: false }))
+    Object.entries(SYMBOLS).map(([ySym, sSym]) => fetchStooq(ySym, sSym))
   );
 
   const quotes = [];
-  for (let i = 0; i < results.length; i++) {
-    const r = results[i];
-    if (r.status === 'fulfilled' && r.value) {
-      const q = r.value;
-      quotes.push({
-        symbol:                     q.symbol,
-        regularMarketPrice:         q.regularMarketPrice,
-        regularMarketChange:        q.regularMarketChange,
-        regularMarketChangePercent: q.regularMarketChangePercent,
-        regularMarketVolume:        q.regularMarketVolume,
-        regularMarketOpen:          q.regularMarketOpen,
-      });
-    } else {
-      console.warn('[yahoo-finance2]', SYMBOLS[i], r.reason?.message || r.reason);
-    }
+  for (const r of results) {
+    if (r.status === 'fulfilled') quotes.push(r.value);
+    else console.warn('[stooq]', r.reason?.message);
   }
 
-  if (!quotes.length) throw new Error('sin datos de Yahoo Finance');
+  if (!quotes.length) throw new Error('sin datos');
   return { quoteResponse: { result: quotes, error: null } };
 }
 
-// ── GET /api/market ──────────────────────────────────────
 app.get('/api/market', async (req, res) => {
   try {
-    const data = await fetchAllMarket();
+    const data = await fetchAll();
     cache = { data, ts: Date.now() };
     res.json({ ...data, _ts: cache.ts, _cached: false });
   } catch (e) {
     console.error('[api/market]', e.message);
     if (cache.data) {
       const age = Date.now() - cache.ts;
-      console.warn('usando cache de', Math.round(age / 1000), 's atrás');
       res.json({ ...cache.data, _ts: cache.ts, _cached: true, _age: age });
     } else {
       res.status(503).json({ error: e.message });
@@ -59,7 +92,6 @@ app.get('/api/market', async (req, res) => {
   }
 });
 
-// ── GET /health ──────────────────────────────────────────
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
