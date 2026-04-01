@@ -117,6 +117,21 @@ app.get('/api/market', async (req, res) => {
   }
 });
 
+// ── GET /debug/stooq?s=ggal.us — ver CSV crudo ──────────
+app.get('/debug/stooq', async (req, res) => {
+  const s = req.query.s || 'ggal.us';
+  try {
+    const r = await fetch(STOOQ_URL(s), {
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      signal: AbortSignal.timeout(8000),
+    });
+    const text = await r.text();
+    res.type('text').send(text);
+  } catch (e) {
+    res.status(500).send(e.message);
+  }
+});
+
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
