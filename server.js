@@ -24,47 +24,42 @@ app.use((req, res, next) => {
   next();
 });
 
-// Parsea el CSV de Stooq manejando comas dentro del campo Volume
+// Parsea el CSV de Stooq.
+// El orden REAL de los datos es: Symbol, Time, Open, High, Low, Close, Volume..., Date
+// (Stooq devuelve Date al final aunque los headers digan otra cosa)
+// Volume puede tener comas internas → detectamos el campo Date por patrón YYYY-MM-DD
 function parseStooqCsv(text) {
   const lines = text.trim().replace(/\r/g, '').split('\n');
   if (lines.length < 2) throw new Error('CSV vacío');
 
-  const headers = lines[0].split(',').map(h => h.trim());
-  const rawVals = lines[1].split(',').map(v => v.trim());
+  const parts = lines[1].split(',').map(v => v.trim());
+  // parts[0] = Symbol
+  // parts[1] = Time
+  // parts[2] = Open
+  // parts[3] = High
+  // parts[4] = Low
+  // parts[5] = Close  ← precio real
+  // parts[6..n-1] = Volume (puede estar partido por comas)
+  // parts[n] = Date (YYYY-MM-DD)
 
-  // Volume puede tener comas internas (ej: "1,234,567") que generan columnas extra
-  const extra  = rawVals.length - headers.length;
-  const volIdx = headers.indexOf('Volume');
+  const close = parseFloat(parts[5]);
+  const open  = parseFloat(parts[2]);
 
-  // Reconstruir valores fusionando las partes extra en el campo Volume
-  const vals = [];
-  let ri = 0;
-  for (let hi = 0; hi < headers.length; hi++) {
-    if (hi === volIdx && extra > 0) {
-      vals.push(rawVals.slice(ri, ri + extra + 1).join(''));
-      ri += extra + 1;
-    } else {
-      vals.push(rawVals[ri++]);
-    }
+  if (isNaN(close) || close <= 0) throw new Error('precio inválido, raw: ' + lines[1]);
+
+  // Acumular partes de Volume hasta encontrar el campo Date (YYYY-MM-DD)
+  const volParts = [];
+  const dateRe   = /^\d{4}-\d{2}-\d{2}$/;
+  for (let i = 6; i < parts.length; i++) {
+    if (dateRe.test(parts[i])) break;
+    volParts.push(parts[i]);
   }
+  const volume = parseInt(volParts.join('').replace(/,/g, '')) || 0;
 
-  const row = {};
-  headers.forEach((h, i) => row[h] = vals[i]);
+  const chg = isNaN(open) ? 0 : close - open;
+  const pct = (!isNaN(open) && open > 0) ? (chg / open) * 100 : 0;
 
-  const close = parseFloat(row['Close']);
-  const open  = parseFloat(row['Open']);
-  const chg   = parseFloat(row['Change']);
-  const pct   = parseFloat(row['Change%']);
-
-  if (isNaN(close) || close <= 0) throw new Error('precio inválido: ' + JSON.stringify(row));
-
-  return {
-    close,
-    open:   isNaN(open) ? close : open,
-    chg:    isNaN(chg)  ? 0     : chg,
-    pct:    isNaN(pct)  ? 0     : pct,
-    volume: parseInt((row['Volume'] || '0').replace(/,/g, '')) || 0,
-  };
+  return { close, open: isNaN(open) ? close : open, chg, pct, volume };
 }
 
 async function fetchStooq(ySym, sSym) {
