@@ -1,19 +1,10 @@
 const express = require('express');
-const app = express();
+const yahooFinance = require('yahoo-finance2').default;
+
+const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// ── Mapeo símbolo Yahoo → Stooq ──
-const SYMBOLS = {
-  'GGAL':    'ggal.us',
-  'GGAL.BA': 'ggal.ba',
-  '^GSPC':   '^spx',
-  '^IXIC':   '^ndq',
-  '^DJI':    '^dji',
-  '^MERV':   '^merv',
-  'BMA.BA':  'bma.ba',
-  'BBAR.BA': 'bbar.ba',
-  'SUPV.BA': 'supv.ba',
-};
+const SYMBOLS = ['GGAL', 'GGAL.BA', '^GSPC', '^IXIC', '^DJI', '^MERV', 'BMA.BA', 'BBAR.BA', 'SUPV.BA'];
 
 let cache = { data: null, ts: 0 };
 
@@ -23,52 +14,30 @@ app.use((req, res, next) => {
   next();
 });
 
-async function fetchStooq(ySym, sSym) {
-  const url = `https://stooq.com/q/l/?f=sd2t2ohlcvde&h&e=csv&s=${sSym}`;
-  const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
-  if (!r.ok) throw new Error('HTTP ' + r.status);
-  const text = await r.text();
-
-  const lines = text.trim().replace(/\r/g, '').split('\n');
-  if (lines.length < 2) throw new Error('CSV vacío');
-
-  const headers = lines[0].split(',').map(h => h.trim());
-  const vals    = lines[1].split(',').map(v => v.trim());
-  const row = {};
-  headers.forEach((h, i) => row[h] = vals[i]);
-
-  const close = parseFloat(row['Close']);
-  const open  = parseFloat(row['Open']);
-  const chgF  = parseFloat(row['Change']);
-  const pctF  = parseFloat(row['Change%']);
-
-  if (isNaN(close) || close <= 0) throw new Error('precio inválido');
-
-  const change = !isNaN(chgF) ? chgF : (close - open);
-  const pct    = !isNaN(pctF) ? pctF : (open > 0 ? (change / open) * 100 : 0);
-
-  return {
-    symbol: ySym,
-    regularMarketPrice:         close,
-    regularMarketChange:        change,
-    regularMarketChangePercent: pct,
-    regularMarketVolume:        parseInt(row['Volume'] || '0'),
-    regularMarketOpen:          open,
-  };
-}
-
 async function fetchAllMarket() {
   const results = await Promise.allSettled(
-    Object.entries(SYMBOLS).map(([ySym, sSym]) => fetchStooq(ySym, sSym))
+    SYMBOLS.map(s => yahooFinance.quote(s, {}, { validateResult: false }))
   );
 
   const quotes = [];
-  for (const r of results) {
-    if (r.status === 'fulfilled') quotes.push(r.value);
-    else console.warn('[stooq] fallo:', r.reason?.message);
+  for (let i = 0; i < results.length; i++) {
+    const r = results[i];
+    if (r.status === 'fulfilled' && r.value) {
+      const q = r.value;
+      quotes.push({
+        symbol:                     q.symbol,
+        regularMarketPrice:         q.regularMarketPrice,
+        regularMarketChange:        q.regularMarketChange,
+        regularMarketChangePercent: q.regularMarketChangePercent,
+        regularMarketVolume:        q.regularMarketVolume,
+        regularMarketOpen:          q.regularMarketOpen,
+      });
+    } else {
+      console.warn('[yahoo-finance2]', SYMBOLS[i], r.reason?.message || r.reason);
+    }
   }
 
-  if (!quotes.length) throw new Error('sin datos de Stooq');
+  if (!quotes.length) throw new Error('sin datos de Yahoo Finance');
   return { quoteResponse: { result: quotes, error: null } };
 }
 
