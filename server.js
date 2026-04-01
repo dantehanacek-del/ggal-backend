@@ -1,18 +1,19 @@
-const express = require('express');
+const express      = require('express');
+const yahooFinance = require('yahoo-finance2').default;
+
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-const SYMBOLS = {
-  'GGAL':    'ggal.us',
-  'GGAL.BA': 'ggal.ba',
-  '^GSPC':   '^spx',
-  '^IXIC':   '^ndq',
-  '^DJI':    '^dji',
-  '^MERV':   '^merv',
-  'BMA.BA':  'bma.ba',
-  'BBAR.BA': 'bbar.ba',
-  'SUPV.BA': 'supv.ba',
+// ── Stooq: funciona para símbolos US ──
+const STOOQ_SYMS = {
+  'GGAL':  'ggal.us',
+  '^GSPC': '^spx',
+  '^IXIC': '^ndq',
+  '^DJI':  '^dji',
 };
+
+// ── Yahoo Finance: para mercado argentino (BYMA) ──
+const YF_SYMS = ['GGAL.BA', '^MERV', 'BMA.BA', 'BBAR.BA', 'SUPV.BA'];
 
 const STOOQ_URL = s => `https://stooq.com/q/l/?f=sd2t2ohlcvde&h&e=csv&s=${s}`;
 
@@ -24,30 +25,18 @@ app.use((req, res, next) => {
   next();
 });
 
-// Parsea el CSV de Stooq.
-// El orden REAL de los datos es: Symbol, Time, Open, High, Low, Close, Volume..., Date
-// (Stooq devuelve Date al final aunque los headers digan otra cosa)
-// Volume puede tener comas internas → detectamos el campo Date por patrón YYYY-MM-DD
+// ── Parser Stooq: columnas reales = Symbol, Time, Open, High, Low, Close, Volume..., Date ──
 function parseStooqCsv(text) {
   const lines = text.trim().replace(/\r/g, '').split('\n');
   if (lines.length < 2) throw new Error('CSV vacío');
 
   const parts = lines[1].split(',').map(v => v.trim());
-  // parts[0] = Symbol
-  // parts[1] = Time
-  // parts[2] = Open
-  // parts[3] = High
-  // parts[4] = Low
-  // parts[5] = Close  ← precio real
-  // parts[6..n-1] = Volume (puede estar partido por comas)
-  // parts[n] = Date (YYYY-MM-DD)
-
   const close = parseFloat(parts[5]);
   const open  = parseFloat(parts[2]);
 
-  if (isNaN(close) || close <= 0) throw new Error('precio inválido, raw: ' + lines[1]);
+  if (isNaN(close) || close <= 0) throw new Error('N/D o precio inválido');
 
-  // Acumular partes de Volume hasta encontrar el campo Date (YYYY-MM-DD)
+  // Volume: acumular partes hasta el campo Date (YYYY-MM-DD)
   const volParts = [];
   const dateRe   = /^\d{4}-\d{2}-\d{2}$/;
   for (let i = 6; i < parts.length; i++) {
@@ -55,9 +44,8 @@ function parseStooqCsv(text) {
     volParts.push(parts[i]);
   }
   const volume = parseInt(volParts.join('').replace(/,/g, '')) || 0;
-
-  const chg = isNaN(open) ? 0 : close - open;
-  const pct = (!isNaN(open) && open > 0) ? (chg / open) * 100 : 0;
+  const chg    = isNaN(open) ? 0 : close - open;
+  const pct    = (!isNaN(open) && open > 0) ? (chg / open) * 100 : 0;
 
   return { close, open: isNaN(open) ? close : open, chg, pct, volume };
 }
@@ -68,34 +56,43 @@ async function fetchStooq(ySym, sSym) {
     signal: AbortSignal.timeout(8000),
   });
   if (!r.ok) throw new Error('HTTP ' + r.status);
-  const text = await r.text();
-  const { close, open, chg, pct, volume } = parseStooqCsv(text);
-
+  const { close, open, chg, pct, volume } = parseStooqCsv(await r.text());
   return {
-    symbol:                     ySym,
-    regularMarketPrice:         close,
-    regularMarketChange:        chg,
-    regularMarketChangePercent: pct,
-    regularMarketVolume:        volume,
-    regularMarketOpen:          open,
+    symbol: ySym, regularMarketPrice: close, regularMarketChange: chg,
+    regularMarketChangePercent: pct, regularMarketVolume: volume, regularMarketOpen: open,
+  };
+}
+
+async function fetchYF(sym) {
+  const q = await yahooFinance.quote(sym, {}, { validateResult: false });
+  if (!q?.regularMarketPrice) throw new Error('sin precio');
+  return {
+    symbol:                     q.symbol,
+    regularMarketPrice:         q.regularMarketPrice,
+    regularMarketChange:        q.regularMarketChange        ?? 0,
+    regularMarketChangePercent: q.regularMarketChangePercent ?? 0,
+    regularMarketVolume:        q.regularMarketVolume        ?? 0,
+    regularMarketOpen:          q.regularMarketOpen          ?? q.regularMarketPrice,
   };
 }
 
 async function fetchAll() {
-  const results = await Promise.allSettled(
-    Object.entries(SYMBOLS).map(([ySym, sSym]) => fetchStooq(ySym, sSym))
-  );
+  const [stooqResults, yfResults] = await Promise.all([
+    Promise.allSettled(Object.entries(STOOQ_SYMS).map(([y, s]) => fetchStooq(y, s))),
+    Promise.allSettled(YF_SYMS.map(s => fetchYF(s))),
+  ]);
 
   const quotes = [];
-  for (const r of results) {
+  for (const r of [...stooqResults, ...yfResults]) {
     if (r.status === 'fulfilled') quotes.push(r.value);
-    else console.warn('[stooq]', r.reason?.message);
+    else console.warn('[fetch]', r.reason?.message || r.reason);
   }
 
   if (!quotes.length) throw new Error('sin datos');
   return { quoteResponse: { result: quotes, error: null } };
 }
 
+// ── GET /api/market ──────────────────────────────────────
 app.get('/api/market', async (req, res) => {
   try {
     const data = await fetchAll();
@@ -112,21 +109,18 @@ app.get('/api/market', async (req, res) => {
   }
 });
 
-// ── GET /debug/stooq?s=ggal.us — ver CSV crudo ──────────
+// ── GET /debug/stooq?s=ggal.us ───────────────────────────
 app.get('/debug/stooq', async (req, res) => {
   const s = req.query.s || 'ggal.us';
   try {
-    const r = await fetch(STOOQ_URL(s), {
-      headers: { 'User-Agent': 'Mozilla/5.0' },
-      signal: AbortSignal.timeout(8000),
-    });
-    const text = await r.text();
-    res.type('text').send(text);
+    const r = await fetch(STOOQ_URL(s), { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(8000) });
+    res.type('text').send(await r.text());
   } catch (e) {
     res.status(500).send(e.message);
   }
 });
 
+// ── GET /health ──────────────────────────────────────────
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
